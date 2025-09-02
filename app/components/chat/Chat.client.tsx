@@ -134,6 +134,15 @@ export const ChatImpl = memo(
     );
     const supabaseAlert = useStore(workbenchStore.supabaseAlert);
     const { activeProviders, promptId, autoSelectTemplate, contextOptimizationEnabled } = useSettings();
+
+    // Disable context optimization for the first prompt-param-triggered turn
+    const [contextOptimizationOverride, setContextOptimizationOverride] = useState<boolean | null>(() => {
+      if (typeof window === 'undefined') return null;
+      const prompt = new URLSearchParams(window.location.search).get('prompt');
+      const isGit = window.location.pathname.startsWith('/git');
+      return prompt && !isGit ? false : null;
+    });
+
     const [llmErrorAlert, setLlmErrorAlert] = useState<LlmErrorAlertType | undefined>(undefined);
     const [model, setModel] = useState(() => {
       const savedModel = Cookies.get('selectedModel');
@@ -170,7 +179,7 @@ export const ChatImpl = memo(
         apiKeys,
         files,
         promptId,
-        contextOptimization: contextOptimizationEnabled,
+        contextOptimization: contextOptimizationOverride ?? contextOptimizationEnabled,
         chatMode,
         designScheme,
         supabase: {
@@ -186,11 +195,13 @@ export const ChatImpl = memo(
       sendExtraMessageFields: true,
       onError: (e) => {
         setFakeLoading(false);
+        setContextOptimizationOverride(null);
         handleError(e, 'chat');
       },
       onFinish: (message, response) => {
         const usage = response.usage;
         setData(undefined);
+        setContextOptimizationOverride(null);
 
         if (usage) {
           console.log('Token usage:', usage);
