@@ -180,6 +180,8 @@ export const ChatImpl = memo(
         files,
         promptId,
         contextOptimization: contextOptimizationOverride ?? contextOptimizationEnabled,
+        // Ensure the server also slices message history for the first prompt-param turn
+        skipContextOnce: contextOptimizationOverride === false,
         chatMode,
         designScheme,
         supabase: {

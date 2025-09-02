@@ -39,7 +39,7 @@ function parseCookies(cookieHeader: string): Record<string, string> {
 }
 
 async function chatAction({ context, request }: ActionFunctionArgs) {
-  const { messages, files, promptId, contextOptimization, supabase, chatMode, designScheme, maxLLMSteps } =
+  const { messages, files, promptId, contextOptimization, supabase, chatMode, designScheme, maxLLMSteps, skipContextOnce } =
     await request.json<{
       messages: Messages;
       files: any;
@@ -56,8 +56,12 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
         };
       };
       maxLLMSteps: number;
+      skipContextOnce?: boolean;
     }>();
 
+  const effectiveContextOptimization = contextOptimization;
+  const effectiveFiles = files;
+  
   const cookieHeader = request.headers.get('Cookie');
   const apiKeys = JSON.parse(parseCookies(cookieHeader || '').apiKeys || '{}');
   const providerSettings: Record<string, IProviderSetting> = JSON.parse(
@@ -83,18 +87,35 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
     const dataStream = createDataStream({
       async execute(dataStream) {
-        const filePaths = getFilePaths(files || {});
+        const filePaths = getFilePaths(effectiveFiles || {});
         let filteredFiles: FileMap | undefined = undefined;
         let summary: string | undefined = undefined;
         let messageSliceId = 0;
 
-        const processedMessages = await mcpService.processToolInvocations(messages, dataStream);
+        // Always process tool invocations so pre-seeded actions (e.g., starter commands) still execute
+        let processedMessages = await mcpService.processToolInvocations(messages, dataStream);
 
         if (processedMessages.length > 3) {
           messageSliceId = processedMessages.length - 3;
         }
 
-        if (filePaths.length > 0 && contextOptimization) {
+        // Build LLM-facing messages, optionally slimming down the first prompt-param turn
+        let llmMessages = [...processedMessages];
+        if (skipContextOnce) {
+          // Drop the massive imported-files artifact from LLM prompt, keep the rest (starter template + commands)
+          llmMessages = llmMessages.filter(
+            (m: any) =>
+              !(
+                m.role === 'assistant' &&
+                typeof m.content === 'string' &&
+                m.content.includes('id="imported-files"')
+              ),
+          );
+        }
+
+        // First-turn history slimming handled above in llmMessages
+
+        if (filePaths.length > 0 && effectiveContextOptimization) {
           logger.debug('Generating Chat Summary');
           dataStream.writeData({
             type: 'progress',
@@ -108,12 +129,12 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           console.log(`Messages count: ${processedMessages.length}`);
 
           summary = await createSummary({
-            messages: [...processedMessages],
+            messages: [...llmMessages],
             env: context.cloudflare?.env,
             apiKeys,
             providerSettings,
             promptId,
-            contextOptimization,
+            contextOptimization: effectiveContextOptimization,
             onFinish(resp) {
               if (resp.usage) {
                 logger.debug('createSummary token usage', JSON.stringify(resp.usage));
@@ -150,13 +171,13 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           // Select context files
           console.log(`Messages count: ${processedMessages.length}`);
           filteredFiles = await selectContext({
-            messages: [...processedMessages],
+            messages: [...llmMessages],
             env: context.cloudflare?.env,
             apiKeys,
-            files,
+            files: effectiveFiles,
             providerSettings,
             promptId,
-            contextOptimization,
+            contextOptimization: effectiveContextOptimization,
             summary,
             onFinish(resp) {
               if (resp.usage) {
@@ -246,24 +267,30 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
             logger.info(`Reached max token limit (${MAX_TOKENS}): Continuing message (${switchesLeft} switches left)`);
 
-            const lastUserMessage = processedMessages.filter((x) => x.role == 'user').slice(-1)[0];
+            const lastUserMessage = llmMessages.filter((x: any) => x.role == 'user').slice(-1)[0];
             const { model, provider } = extractPropertiesFromMessage(lastUserMessage);
-            processedMessages.push({ id: generateId(), role: 'assistant', content });
-            processedMessages.push({
-              id: generateId(),
-              role: 'user',
-              content: `[Model: ${model}]\n\n[Provider: ${provider}]\n\n${CONTINUE_PROMPT}`,
-            });
+            const continuedMessages = [
+              ...llmMessages,
+              { role: 'assistant' as const, content },
+              {
+                role: 'user' as const,
+                content: `[Model: ${model}]\n\n[Provider: ${provider}]\n\n${CONTINUE_PROMPT}`,
+              },
+            ].map((m: any) => ({
+              role: m.role as 'user' | 'assistant' | 'system' | 'data',
+              content: (m as any).content,
+              parts: (m as any).parts,
+            }));
 
             const result = await streamText({
-              messages: [...processedMessages],
+              messages: continuedMessages,
               env: context.cloudflare?.env,
               options,
               apiKeys,
-              files,
+              files: effectiveFiles,
               providerSettings,
               promptId,
-              contextOptimization,
+              contextOptimization: effectiveContextOptimization,
               contextFiles: filteredFiles,
               chatMode,
               designScheme,
@@ -296,15 +323,21 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           message: 'Generating Response',
         } satisfies ProgressAnnotation);
 
+        const initialMessages = llmMessages.map((m: any) => ({
+          role: m.role as 'user' | 'assistant' | 'system' | 'data',
+          content: (m as any).content,
+          parts: (m as any).parts,
+        }));
+
         const result = await streamText({
-          messages: [...processedMessages],
+          messages: initialMessages,
           env: context.cloudflare?.env,
           options,
           apiKeys,
-          files,
+          files: effectiveFiles,
           providerSettings,
           promptId,
-          contextOptimization,
+          contextOptimization: effectiveContextOptimization,
           contextFiles: filteredFiles,
           chatMode,
           designScheme,
